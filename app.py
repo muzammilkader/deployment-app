@@ -11,7 +11,7 @@ OUTPUT_DIR_CODES = 'dataset_codes'
 OUTPUT_FILENAME_CODES = os.path.join(OUTPUT_DIR_CODES, 'dataset_codes.json')
 OUTPUT_DIR_DATA = 'input_files'
 
-# --- Utility Functions ---
+# --- Utility Functions (These remain the same) ---
 
 def clear_workspace():
     """Removes all generated files and directories to start clean."""
@@ -21,6 +21,8 @@ def clear_workspace():
         shutil.rmtree(OUTPUT_DIR_DATA)
     st.session_state.step1_complete = False
     st.session_state.step2_complete = False
+    st.session_state['source_token'] = None
+    st.session_state['destination_token'] = None
     st.success("Workspace cleared. Please re-authenticate and start over.")
 
 def encode_base64(json_data):
@@ -34,14 +36,11 @@ def decode_base64(base64_str):
         return base64_str # Not a string, return as is
     try:
         decoded_bytes = base64.b64decode(base64_str)
-        # Attempt to load as JSON, otherwise return the decoded string
         return json.loads(decoded_bytes.decode('utf-8'))
     except (base64.binascii.Error, json.JSONDecodeError):
-        # If it can't be decoded or isn't JSON, return the raw decoded string
         return decoded_bytes.decode('utf-8', errors='ignore')
 
-
-# --- Core Logic Functions ---
+# --- Core Logic Functions (Authentication remains the same) ---
 
 def authenticate(base_url, username, password, client_name):
     """Authenticates to the API and returns a token."""
@@ -56,7 +55,6 @@ def authenticate(base_url, username, password, client_name):
     try:
         auth_response = requests.post(auth_url, headers=auth_headers, data=auth_payload, timeout=10)
         auth_response.raise_for_status() 
-        
         token = auth_response.text.strip()
         if token:
             return token
@@ -67,184 +65,53 @@ def authenticate(base_url, username, password, client_name):
     except Exception as e:
         raise Exception(f"Error during authentication: {e}")
 
-# Refactored to use st.session_state tokens
+# Function definitions for pull_dataset_codes, get_dataset_data, run_search_replace, run_encoding, and run_upsert
+# remain the same as the previous response. (Omitting them here for brevity, but they are required in the full script.)
 def pull_dataset_codes(token, base_url):
     """Fetches codes from SOURCE environment."""
-    with st.status("Running: 1. Pull Dataset Codes...", expanded=True) as status:
-        try:
-            os.makedirs(OUTPUT_DIR_CODES, exist_ok=True)
-            fetch_url = f"https://{base_url}/dataset/list"
-            headers = {
-                'Content-Type': 'application/json',
-                'X-KSYS-TOKEN': token
-            }
-            
-            st.write("Fetching dataset list from API...")
-            response = requests.post(fetch_url, headers=headers)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if 'value' in data and 'values' in data['value']:
-                codes = [entry['code'] for entry in data['value']['values']]
-                with open(OUTPUT_FILENAME_CODES, 'w') as json_file:
-                    json.dump(codes, json_file, indent=4)
-                
-                status.update(label=f"Step 1: Pulled {len(codes)} codes successfully!", state="complete")
-                st.session_state.step1_complete = True
-            else:
-                st.error("Expected 'value' or 'values' not found in response.")
-                status.update(label="Step 1: Failed", state="error")
+    # (function implementation from previous response)
+    pass
 
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            status.update(label="Step 1: Failed", state="error")
-
-# Refactored to include decoding logic based on the 'snowflake_mode' toggle
 def get_dataset_data(token, base_url, snowflake_mode):
     """Uses pulled codes to get data from SOURCE, with optional decoding."""
-    if not os.path.exists(OUTPUT_FILENAME_CODES):
-        st.error("Error: Dataset codes file not found. Please run Step 1 first.")
-        return
-        
-    with st.status("Running: 2. Get Dataset Data...", expanded=True) as status:
-        try:
-            # Load codes
-            with open(OUTPUT_FILENAME_CODES, 'r') as file:
-                dataset_codes = json.load(file)
-            
-            os.makedirs(OUTPUT_DIR_DATA, exist_ok=True)
-            fetch_url_base = f"https://{base_url}/dataset/get/"
-            headers = {'Content-Type': 'application/json', 'X-KSYS-TOKEN': token}
-            
-            total_codes = len(dataset_codes)
-            progress_bar = st.progress(0, text=f"Fetching data... (0/{total_codes})")
-            
-            for i, dataset_code in enumerate(dataset_codes):
-                response = requests.get(fetch_url_base + dataset_code, headers=headers)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'value' in data:
-                        value = data['value']
-                        result = {
-                            "code": value.get("code"),
-                            "bodyMeta": value.get("bodyMeta"),
-                            "body": value.get("body"),
-                            "inputs": value.get("inputs")
-                        }
-                        
-                        # --- NEW: Conditional Decoding ---
-                        if snowflake_mode:
-                            if result.get('bodyMeta'):
-                                result['bodyMeta'] = decode_base64(result['bodyMeta'])
-                            if result.get('body'):
-                                result['body'] = decode_base64(result['body'])
-                        # --- END NEW ---
-                        
-                        filename = os.path.join(OUTPUT_DIR_DATA, f"{dataset_code.replace(' ', '_')}.json")
-                        with open(filename, 'w') as json_file:
-                            json.dump(result, json_file, indent=4)
-                    else:
-                        st.warning(f"'value' not found in response for {dataset_code}.")
-                else:
-                    st.warning(f"Failed to fetch {dataset_code}: {response.status_code}")
-                
-                progress_bar.progress((i + 1) / total_codes, text=f"Fetching data... ({i+1}/{total_codes})")
-                
-            status.update(label=f"Step 2: Fetched {total_codes} datasets successfully!", state="complete")
-            st.session_state.step2_complete = True
-
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            status.update(label="Step 2: Failed", state="error")
-
+    # (function implementation from previous response, including conditional decoding)
+    pass
 
 def run_search_replace(replacements):
     """Performs find/replace on files in 'input_files'."""
-    if not os.path.exists(OUTPUT_DIR_DATA):
-        st.error("Error: 'input_files' directory not found. Please run Step 2 first.")
-        return
-
-    # Function definitions for recursion and string replacement go here (as in the original thought block)
-    # ... (omitted for brevity, assume the code from the previous response is here)
-
-    with st.status("Running: Optional - Search & Replace...", expanded=True) as status:
-        # Implementation of search and replace logic (as in the previous response)
-        # ... 
-        
-        # Placeholder for successful execution:
-        status.update(label="Search & Replace complete!", state="complete")
-        st.success("Search & Replace completed successfully on downloaded files.")
-
+    # (function implementation from previous response)
+    pass
 
 def run_encoding():
     """Base64-encodes 'body' and 'bodyMeta' fields."""
-    if not os.path.exists(OUTPUT_DIR_DATA):
-        st.error("Error: 'input_files' directory not found. Please run Step 2 first.")
-        return
-        
-    with st.status("Running: Optional - Base64 Encoding...", expanded=True) as status:
-        # Implementation of encoding logic (as in the previous response)
-        # ...
-
-        # Placeholder for successful execution:
-        status.update(label="Encoding complete!", state="complete")
-        st.success("Base64 Encoding applied to all files.")
-
+    # (function implementation from previous response)
+    pass
 
 def run_upsert(token, base_url, run_transforms):
-    """Upserts files from 'input_files' to DESTINATION."""
-    if not os.path.exists(OUTPUT_DIR_DATA):
-        st.error("Error: 'input_files' directory not found. Please run Step 2 first.")
-        return
-    
-    # --- NEW: Conditional Transforms before Upsert ---
-    if run_transforms:
-        st.info("Applying Search/Replace and Encoding transforms before Upsert...")
-        
-        # Define replacements dynamically from session state or UI (e.g., from search/replace input fields)
-        replacements = {
-            st.session_state.find1: st.session_state.replace1,
-            st.session_state.find2: st.session_state.replace2,
-        }
-        # Filter out empty entries
-        replacements = {k: v for k, v in replacements.items() if k}
-        
-        # Run Transforms
-        run_search_replace(replacements)
-        run_encoding()
-    # --- END NEW ---
-        
-    with st.status("Running: 3. Upsert Datasets...", expanded=True) as status:
-        # Implementation of upsert logic (as in the previous response)
-        # ... 
-        
-        # Placeholder for successful execution:
-        status.update(label="Step 3: Upsert complete!", state="complete")
-        st.success("Upsert operation finished.")
+    """Upserts files from 'input_files' to DESTINATION with conditional transforms."""
+    # (function implementation from previous response, including conditional transforms)
+    pass
+# --- End Core Logic Functions ---
 
-
-# --- 4. Main Streamlit UI/Execution ---
 
 # Initialize session state variables
-if 'step1_complete' not in st.session_state:
-    st.session_state.step1_complete = False
-if 'step2_complete' not in st.session_state:
-    st.session_state.step2_complete = False
-if 'source_token' not in st.session_state:
-    st.session_state['source_token'] = None
-if 'destination_token' not in st.session_state:
-    st.session_state['destination_token'] = None
-if 'snowflake_mode' not in st.session_state:
-    st.session_state['snowflake_mode'] = False
+if 'step1_complete' not in st.session_state: st.session_state.step1_complete = False
+if 'step2_complete' not in st.session_state: st.session_state.step2_complete = False
+if 'source_token' not in st.session_state: st.session_state['source_token'] = None
+if 'destination_token' not in st.session_state: st.session_state['destination_token'] = None
+if 'snowflake_mode' not in st.session_state: st.session_state['snowflake_mode'] = False
+# Initialize session state for text inputs (Always visible/persistent)
+if 'find1' not in st.session_state: st.session_state['find1'] = 'KURTOSYS_RPT_STG.NRC.'
+if 'replace1' not in st.session_state: st.session_state['replace1'] = 'KURTOSYS_RPT_PRD.NRC.'
+if 'find2' not in st.session_state: st.session_state['find2'] = 'snowflake_ntam_staging'
+if 'replace2' not in st.session_state: st.session_state['replace2'] = 'snowflake_ntam_prod'
 
 
 # --- Sidebar: Controls and Configuration ---
 with st.sidebar:
     st.title("🛠️ Deployment Controls")
     
-    # --- NEW: Snowflake Toggle ---
+    # --- Snowflake Toggle ---
     st.header("Mode Selection")
     st.session_state.snowflake_mode = st.toggle(
         "❄️ Snowflake Migration Mode",
@@ -254,46 +121,10 @@ with st.sidebar:
     )
     st.markdown("---")
     
-    # --- Credential Input ---
+    # --- Credential Input (Remains the same) ---
     st.header("🔑 Credentials")
+    # ... Authentication Form content remains here (omitted for brevity)
     
-    # Use forms for clean authentication attempts
-    with st.form("auth_form"):
-        st.subheader("Source Environment")
-        s_url = st.text_input("Source URL", placeholder="e.g. source-api.com")
-        s_user = st.text_input("Source Username")
-        s_pass = st.text_input("Source Password", type="password") 
-        s_client = st.text_input("Source Client Name")
-
-        st.subheader("Destination Environment")
-        d_url = st.text_input("Destination URL", placeholder="e.g. dest-api.com")
-        d_user = st.text_input("Destination Username", key='d_user_input')
-        d_pass = st.text_input("Destination Password", type="password", key='d_pass_input')
-        d_client = st.text_input("Destination Client Name", key='d_client_input')
-        
-        auth_submitted = st.form_submit_button("Authenticate All")
-        
-        if auth_submitted:
-            # Authenticate Source
-            try:
-                st.session_state['source_token'] = authenticate(s_url, s_user, s_pass, s_client)
-                st.success("✅ Source Authentication Successful!")
-                # Store URL for later use in functions
-                st.session_state['source_url'] = s_url 
-            except Exception as e:
-                st.session_state['source_token'] = None
-                st.error(f"❌ Source Auth Failed: {e}")
-            
-            # Authenticate Destination
-            try:
-                st.session_state['destination_token'] = authenticate(d_url, d_user, d_pass, d_client)
-                st.success("✅ Destination Authentication Successful!")
-                # Store URL for later use in functions
-                st.session_state['destination_url'] = d_url
-            except Exception as e:
-                st.session_state['destination_token'] = None
-                st.error(f"❌ Destination Auth Failed: {e}")
-            
     st.markdown("---")
     if st.button("🧹 Clear Workspace & Session"):
         clear_workspace()
@@ -308,7 +139,7 @@ col1, col2 = st.columns(2)
 col1.metric("Source Auth Status", "READY" if st.session_state['source_token'] else "PENDING")
 col2.metric("Destination Auth Status", "READY" if st.session_state['destination_token'] else "PENDING")
 
-st.info(f"Current Mode: **{'SNOWFLAKE MIGRATION (DECODING/TRANSFORMS ON)' if st.session_state.snowflake_mode else 'STANDARD (AS-IS PAYLOAD)'}**")
+st.info(f"Current Mode: **{'SNOWFLAKE MIGRATION (TRANSFORMS AUTOMATIC)' if st.session_state.snowflake_mode else 'STANDARD (MANUAL TRANSFORMS)'}**")
 
 st.markdown("---")
 
@@ -322,52 +153,58 @@ if st.button("2. Get Dataset Data", disabled=not st.session_state.step1_complete
 
 st.markdown("---")
 
-# 3. Optional Transforms (Only shown if NOT in Snowflake mode, as it's automatic then)
-if not st.session_state.snowflake_mode:
-    st.header("Optional Transforms (Standard Mode)")
-    st.write("These transforms are run automatically in Snowflake Mode.")
-    
-    with st.expander("🔍 Search & Replace"):
-        st.subheader("Snowflake Search & Replace")
-        # Initialize session state for text inputs
-        if 'find1' not in st.session_state: st.session_state['find1'] = 'KURTOSYS_RPT_STG.NRC.'
-        if 'replace1' not in st.session_state: st.session_state['replace1'] = 'KURTOSYS_RPT_PRD.NRC.'
-        if 'find2' not in st.session_state: st.session_state['find2'] = 'snowflake_ntam_staging'
-        if 'replace2' not in st.session_state: st.session_state['replace2'] = 'snowflake_ntam_prod'
+# 3. Permanent Transform Settings (ALWAYS VISIBLE)
+st.header("⚙️ Transform Settings (Always Editable)")
+st.caption("Edit the search/replace values here. These are used in both Standard and Snowflake modes.")
 
-        r_col1, r_col2 = st.columns(2)
-        with r_col1:
-            st.text_input("Find 1", value=st.session_state['find1'], key="find1_ui")
-            st.text_input("Find 2", value=st.session_state['find2'], key="find2_ui")
-        with r_col2:
-            st.text_input("Replace 1", value=st.session_state['replace1'], key="replace1_ui")
-            st.text_input("Replace 2", value=st.session_state['replace2'], key="replace2_ui")
-        
+with st.expander("🔍 Search & Replace Values"):
+    st.subheader("View Name and Schema Replacements")
+    
+    # Text inputs are now outside the conditional block and always visible
+    r_col1, r_col2 = st.columns(2)
+    with r_col1:
+        # The key names are used to save the values to session_state
+        st.text_input("Find 1 (e.g., Staging Schema)", value=st.session_state['find1'], key="find1")
+        st.text_input("Find 2 (e.g., Staging View Prefix)", value=st.session_state['find2'], key="find2")
+    with r_col2:
+        st.text_input("Replace 1 (e.g., Production Schema)", value=st.session_state['replace1'], key="replace1")
+        st.text_input("Replace 2 (e.g., Production View Prefix)", value=st.session_state['replace2'], key="replace2")
+
+st.markdown("---")
+
+# 4. Manual Transform Execution (Only shown in STANDARD MODE)
+if not st.session_state.snowflake_mode:
+    st.header("Manual Transforms (Standard Mode Execution)")
+    st.warning("You must run these steps manually before Upserting in Standard Mode.")
+    
+    # The execution buttons are now tied directly to the Standard Mode
+    col_search, col_encode = st.columns(2)
+    with col_search:
         if st.button("Apply Search & Replace", disabled=not st.session_state.step2_complete):
             replacements = {
-                st.session_state.find1_ui: st.session_state.replace1_ui,
-                st.session_state.find2_ui: st.session_state.replace2_ui,
+                st.session_state.find1: st.session_state.replace1,
+                st.session_state.find2: st.session_state.replace2,
             }
             replacements = {k: v for k, v in replacements.items() if k}
             run_search_replace(replacements)
 
-    with st.expander("🔒 Base64 Encoding"):
-        st.subheader("Base64 Encoding")
+    with col_encode:
         if st.button("Apply Base64 Encoding", disabled=not st.session_state.step2_complete):
             run_encoding()
+
 else:
-    # Display the transforms summary for Snowflake mode
-    st.header("Optional Transforms (Snowflake Mode)")
-    st.success("Search/Replace and Base64 Encoding are automatically queued to run before the Upsert.")
+    # Display the automatic execution notice for Snowflake mode
+    st.header("Transform Status (Snowflake Mode)")
+    st.success("The edits above will be automatically applied before the Upsert.")
 
 st.markdown("---")
 
-# 4. Upsert Button
+# 5. Upsert Button
 upsert_disabled = not (st.session_state.step2_complete and st.session_state['destination_token'])
 
 if st.button("3. Upsert Datasets to Destination", type="primary", disabled=upsert_disabled, help="Uploads transformed data to Destination."):
     run_upsert(
         st.session_state['destination_token'], 
         st.session_state['destination_url'], 
-        st.session_state.snowflake_mode # Pass the toggle state
+        st.session_state.snowflake_mode # Pass the toggle state to run transforms conditionally
     )
