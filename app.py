@@ -1,398 +1,538 @@
+# app.py
 import streamlit as st
 import requests
 import json
 import os
-import base64
 import time
 import shutil
-import re # Added for search/replace
+from typing import Optional
 
-# --- Constants & Setup ---
-OUTPUT_DIR_CODES = 'dataset_codes'
-OUTPUT_FILENAME_CODES = os.path.join(OUTPUT_DIR_CODES, 'dataset_codes.json')
-OUTPUT_DIR_DATA = 'input_files'
+# -------------------------
+# Config / Constants
+# -------------------------
+OUTPUT_DIR = "input_files"   # saved dataset JSONs for editing
+CODES_FILE = "dataset_codes.json"
 
-# --- 1. Utility Functions ---
+# -------------------------
+# Helper functions
+# -------------------------
+def ensure_dirs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def clear_workspace():
-    """Removes all generated files and directories and resets session state."""
-    if os.path.exists(OUTPUT_DIR_CODES):
-        shutil.rmtree(OUTPUT_DIR_CODES)
-    if os.path.exists(OUTPUT_DIR_DATA):
-        shutil.rmtree(OUTPUT_DIR_DATA)
-    # Reset all session state flags and tokens
-    for key in ['step1_complete', 'step2_complete', 'source_token', 'destination_token']:
-        if key in st.session_state:
-            st.session_state[key] = None if 'token' in key else False
-    st.success("Workspace cleared. Please re-authenticate and start over.")
+def save_local_dataset(code: str, payload: dict):
+    ensure_dirs()
+    path = os.path.join(OUTPUT_DIR, f"{code}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    st.session_state.local_files[code] = path
 
-def encode_base64(json_data):
-    """Encodes a JSON object to a base64 string."""
-    json_str = json.dumps(json_data, separators=(',', ':'))
-    return base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+def load_local_dataset(code: str) -> Optional[dict]:
+    ensure_dirs()
+    path = os.path.join(OUTPUT_DIR, f"{code}.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
 
-def decode_base64(base64_str):
-    """Decodes a base64 string and attempts to load it as JSON."""
-    if not isinstance(base64_str, str): return base64_str
-    try:
-        decoded_bytes = base64.b64decode(base64_str)
-        return json.loads(decoded_bytes.decode('utf-8'))
-    except (base64.binascii.Error, json.JSONDecodeError):
-        return decoded_bytes.decode('utf-8', errors='ignore')
-
-def _recursive_replace(obj, replacements):
-    """Recursively replaces strings in dictionaries and lists."""
-    if isinstance(obj, dict):
-        return {k: _recursive_replace(v, replacements) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_recursive_replace(elem, replacements) for elem in obj]
-    elif isinstance(obj, str):
-        for find, replace in replacements.items():
-            if find and replace:
-                 obj = obj.replace(find, replace)
-        return obj
-    return obj
-
-# --- 2. Core Logic Functions ---
-
-def authenticate(base_url, username, password, client_name):
+def try_auth_endpoints(base_url: str, username: str, password: str, client_name: str, timeout=12) -> str:
     """
-    CRITICAL: Replace the MOCK implementation below with your actual API call.
+    Try expected auth endpoints and return token string.
+    Tries common endpoints and token formats:
+      - POST https://{base_url}/auth/login
+      - POST https://{base_url}/authenticate
+      - POST https://{base_url}/auth
+    Expects either JSON {"token": "..."} or text token in body.
+    Raises Exception if all attempts fail.
     """
-    # MOCK SETUP: Allows testing if the credentials match 'source-api.com' and 'test'
-    if base_url == "source-api.com" and username == "test":
-         return f"MOCK_TOKEN_{time.time()}"
-    
-    auth_url = f"https://{base_url}/auth/login"
-    auth_payload = json.dumps({
-        "username": username,
-        "password": password,
-        "clientName": client_name
-    })
-    auth_headers = {'Content-Type': 'application/json'}
-    
+    candidate_paths = ["/auth/login", "/authenticate", "/auth"]
+    payload = {"username": username, "password": password, "clientName": client_name}
+    headers = {"Content-Type": "application/json"}
+
+    last_err = None
+    for p in candidate_paths:
+        url = f"https://{base_url.rstrip('/')}{p}"
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            continue
+        # Accept 200 or 201
+        if resp.status_code in (200, 201):
+            # Try parse JSON token
+            try:
+                data = resp.json()
+                # common shapes: {"token": "xyz"} or {"access_token": "xyz"} or {"data": {"token": "..."}}
+                for key in ("token", "access_token", "accessToken"):
+                    if key in data and isinstance(data[key], str):
+                        return data[key]
+                # look for token nested
+                if isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, str) and len(v) > 10:
+                            return v
+            except ValueError:
+                # not JSON, maybe raw token text
+                text = resp.text.strip().strip('"')
+                if text:
+                    return text
+        else:
+            last_err = Exception(f"{resp.status_code} {resp.text[:200]}")
+    raise Exception(f"Authentication failed for all endpoints. Last error: {last_err}")
+
+def headers_for(token: str):
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def fetch_dataset_codes(token: str, base_url: str) -> list:
+    """
+    Calls GET /datasets (or /data/datasets) to list dataset codes.
+    Returns list of dicts or raises Exception.
+    """
+    candidate_paths = ["/datasets", "/data/datasets", "/api/datasets"]
+    for p in candidate_paths:
+        url = f"https://{base_url.rstrip('/')}{p}"
+        try:
+            resp = requests.get(url, headers=headers_for(token), timeout=30)
+        except Exception:
+            continue
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                # If API returns dict like {"items":[...]} try to normalize
+                if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+                    return data["items"]
+                if isinstance(data, list):
+                    return data
+                # some APIs return {"datasets": [...]}
+                for k in ("datasets", "data"):
+                    if isinstance(data.get(k), list):
+                        return data[k]
+                # Fallback: if dict of codes
+                return [data]
+            except ValueError:
+                raise Exception("Dataset listing returned invalid JSON.")
+        # else try next candidate
+    raise Exception("Failed to fetch dataset codes from known endpoints.")
+
+def fetch_dataset(token:str, base_url:str, code:str) -> dict:
+    """
+    GET dataset by code. Tries common URL patterns.
+    """
+    candidate_paths = [f"/datasets/{code}", f"/data/datasets/{code}", f"/api/datasets/{code}"]
+    for p in candidate_paths:
+        url = f"https://{base_url.rstrip('/')}{p}"
+        try:
+            resp = requests.get(url, headers=headers_for(token), timeout=30)
+        except Exception:
+            continue
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                raise Exception("Dataset endpoint returned invalid JSON.")
+        elif resp.status_code == 404:
+            continue
+        else:
+            # if other error code, keep trying other patterns
+            continue
+    raise Exception(f"Failed to fetch dataset '{code}' from API.")
+
+def upsert_dataset(token:str, base_url:str, code:str, payload:dict) -> dict:
+    """
+    Attempts to upsert a dataset. Tries PUT /datasets/{code}, POST /datasets, POST /datasets/{code}/upsert
+    Returns API JSON on success.
+    """
+    attempts = []
+    # 1) PUT /datasets/{code}
+    url_put = f"https://{base_url.rstrip('/')}/datasets/{code}"
     try:
-        ### YOUR IMPLEMENTATION LOGIC GOES HERE ###
-        # Example:
-        # auth_response = requests.post(auth_url, headers=auth_headers, data=auth_payload, timeout=10)
-        # auth_response.raise_for_status() 
-        # token = auth_response.text.strip()
-        # if not token: raise ValueError("Token not found.")
-        # return token
-        
-        raise Exception("Authentication API not implemented. (See comments in script.)")
+        r = requests.put(url_put, headers=headers_for(token), json=payload, timeout=30)
+        if r.status_code in (200,201):
+            return try_parse_json_or_text(r)
+        attempts.append((url_put, r.status_code, r.text[:200]))
     except Exception as e:
-        raise Exception(f"Authentication failed: {e}")
+        attempts.append((url_put, "err", str(e)))
 
+    # 2) POST /datasets
+    url_post = f"https://{base_url.rstrip('/')}/datasets"
+    try:
+        r = requests.post(url_post, headers=headers_for(token), json=payload, timeout=30)
+        if r.status_code in (200,201):
+            return try_parse_json_or_text(r)
+        attempts.append((url_post, r.status_code, r.text[:200]))
+    except Exception as e:
+        attempts.append((url_post, "err", str(e)))
 
-def pull_dataset_codes(token, base_url):
-    """Fetches codes from SOURCE environment."""
-    with st.status("Running: 1. Pull Dataset Codes...", expanded=True) as status:
-        ### YOUR IMPLEMENTATION LOGIC GOES HERE ###
-        time.sleep(1) 
-        os.makedirs(OUTPUT_DIR_CODES, exist_ok=True)
-        
-        # MOCK data for testing the next step:
-        codes = ["ExampleCode1", "ExampleCode2", "ExampleCode3"] 
-        with open(OUTPUT_FILENAME_CODES, 'w') as json_file:
-             json.dump(codes, json_file, indent=4)
-        
-        status.update(label=f"Step 1: Pulled {len(codes)} codes successfully!", state="complete")
-        st.session_state.step1_complete = True
+    # 3) POST /datasets/{code}/upsert
+    url_post2 = f"https://{base_url.rstrip('/')}/datasets/{code}/upsert"
+    try:
+        r = requests.post(url_post2, headers=headers_for(token), json=payload, timeout=30)
+        if r.status_code in (200,201):
+            return try_parse_json_or_text(r)
+        attempts.append((url_post2, r.status_code, r.text[:200]))
+    except Exception as e:
+        attempts.append((url_post2, "err", str(e)))
 
+    raise Exception(f"Upsert attempts failed: {attempts}")
 
-def get_dataset_data(token, base_url, snowflake_mode):
-    """Uses pulled codes to get data from SOURCE, with conditional decoding."""
-    if not os.path.exists(OUTPUT_FILENAME_CODES):
-        st.error("Error: Dataset codes file not found. Please run Step 1 first.")
-        return
-    
-    with st.status("Running: 2. Get Dataset Data...", expanded=True) as status:
-        ### YOUR IMPLEMENTATION LOGIC GOES HERE ###
-        time.sleep(2)
-        os.makedirs(OUTPUT_DIR_DATA, exist_ok=True)
-        
-        # MOCK data for testing (Replace this with your actual API calls)
-        mock_body_encoded = base64.b64encode(b'{"key": "value_to_edit", "schema": "KURTOSYS_RPT_STG.NRC."}').decode('utf-8')
-        mock_data = {"bodyMeta": mock_body_encoded, "body": mock_body_encoded}
-        
-        for code in ["ExampleCode1", "ExampleCode2", "ExampleCode3"]:
-            data_to_save = mock_data.copy()
-            
-            if snowflake_mode:
-                # Decodes the payload for manual editing
-                data_to_save['bodyMeta'] = decode_base64(data_to_save['bodyMeta'])
-                data_to_save['body'] = decode_base64(data_to_save['body'])
-            
-            filename = os.path.join(OUTPUT_DIR_DATA, f"{code}.json")
-            with open(filename, 'w') as json_file:
-                 json.dump(data_to_save, json_file, indent=4)
-        
-        status.update(label=f"Step 2: Fetched datasets successfully!", state="complete")
-        st.session_state.step2_complete = True
+def delete_dataset(token:str, base_url:str, code:str) -> dict:
+    """
+    DELETE /datasets/{code}
+    """
+    url = f"https://{base_url.rstrip('/')}/datasets/{code}"
+    r = requests.delete(url, headers=headers_for(token), timeout=30)
+    if r.status_code in (200,204):
+        return {"status": "deleted", "code": code}
+    raise Exception(f"Delete failed ({r.status_code}): {r.text}")
 
+def try_parse_json_or_text(resp: requests.Response):
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status_text": resp.text.strip()}
 
-def run_search_replace(replacements):
-    """Performs find/replace on files in 'input_files'."""
-    if not os.path.exists(OUTPUT_DIR_DATA):
-        st.error("Error: 'input_files' directory not found.")
-        return
-    
-    file_list = [f for f in os.listdir(OUTPUT_DIR_DATA) if f.endswith('.json')]
-    
-    with st.status("Running: Search & Replace...", expanded=True) as status:
-        for filename in file_list:
-            file_path = os.path.join(OUTPUT_DIR_DATA, filename)
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            
-            # Apply recursive replacement to the entire JSON structure
-            new_data = _recursive_replace(data, replacements)
-            
-            with open(file_path, 'w') as f:
-                json.dump(new_data, f, indent=4)
-            status.write(f"Processed: {filename}")
-        
-        status.update(label="Search & Replace complete!", state="complete")
-        st.success("Search & Replace completed successfully on downloaded files.")
+def clear_local_files():
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    st.session_state.local_files = {}
 
-def run_encoding():
-    """Base64-encodes 'body' and 'bodyMeta' fields."""
-    if not os.path.exists(OUTPUT_DIR_DATA):
-        st.error("Error: 'input_files' directory not found.")
-        return
-        
-    file_list = [f for f in os.listdir(OUTPUT_DIR_DATA) if f.endswith('.json')]
-    
-    with st.status("Running: Base64 Encoding...", expanded=True) as status:
-        for filename in file_list:
-            file_path = os.path.join(OUTPUT_DIR_DATA, filename)
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            
-            # Only encode if the content is NOT already encoded (i.e., it is a dictionary/JSON)
-            if isinstance(data.get('bodyMeta'), dict):
-                data['bodyMeta'] = encode_base64(data['bodyMeta'])
-            if isinstance(data.get('body'), dict):
-                data['body'] = encode_base64(data['body'])
-            
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=4)
-            status.write(f"Encoded: {filename}")
-        
-        status.update(label="Encoding complete!", state="complete")
-        st.success("Base64 Encoding applied to all files.")
+# -------------------------
+# Page state init
+# -------------------------
+if "local_files" not in st.session_state:
+    st.session_state.local_files = {}
+if "dataset_codes_raw" not in st.session_state:
+    st.session_state.dataset_codes_raw = []  # raw objects from API
+if "dataset_codes_order" not in st.session_state:
+    st.session_state.dataset_codes_order = []  # list of codes (strings) maintain order
+if "selected_code" not in st.session_state:
+    st.session_state.selected_code = None
+if "edits_saved" not in st.session_state:
+    st.session_state.edits_saved = {}
+if "deploy_checks" not in st.session_state:
+    st.session_state.deploy_checks = {}  # code -> bool
+if "delete_checks" not in st.session_state:
+    st.session_state.delete_checks = {}
 
-def run_upsert(token, base_url, run_transforms):
-    """Upserts files from 'input_files' to DESTINATION with conditional transforms."""
-    if run_transforms:
-        st.info("Applying automatic Search/Replace and Encoding transforms...")
-        
-        # Pull latest values from the editable UI fields
-        replacements = {st.session_state.find1_ui: st.session_state.replace1_ui,
-                        st.session_state.find2_ui: st.session_state.replace2_ui}
-        replacements = {k: v for k, v in replacements.items() if k}
-        
-        run_search_replace(replacements)
-        run_encoding()
-        
-    with st.status("Running: 3. Upsert Datasets...", expanded=True) as status:
-        ### YOUR IMPLEMENTATION LOGIC GOES HERE ###
-        time.sleep(2)
-        status.update(label="Step 3: Upsert complete!", state="complete")
-        st.success("Upsert operation finished successfully.")
+st.set_page_config(page_title="Dataset Deployment", layout="wide")
+st.title("🚚 Dataset Deployment Manager")
 
-
-# --- 3. UI/Execution ---
-
-st.set_page_config(page_title="Deployment App", layout="wide")
-
-# Initialize session state variables
-for key in ['step1_complete', 'step2_complete', 'source_token', 'destination_token', 'snowflake_mode']:
-    if key not in st.session_state:
-        st.session_state[key] = False if key.startswith('step') or key == 'snowflake_mode' else None
-for key in ['find1', 'replace1', 'find2', 'replace2', 'find1_ui', 'replace1_ui', 'find2_ui', 'replace2_ui']:
-    if key not in st.session_state: st.session_state[key] = ''
-
-# Set initial default values for the UI fields (to be picked up by the 'value' attribute)
-if not st.session_state['find1']: st.session_state['find1'] = 'KURTOSYS_RPT_STG.NRC.'
-if not st.session_state['replace1']: st.session_state['replace1'] = 'KURTOSYS_RPT_PRD.NRC.'
-if not st.session_state['find2']: st.session_state['find2'] = 'snowflake_ntam_staging'
-if not st.session_state['replace2']: st.session_state['replace2'] = 'snowflake_ntam_prod'
-
-
-# --- Sidebar: Controls and Configuration ---
+# -------------------------
+# Sidebar: Environment + Auth + Find/Replace
+# -------------------------
 with st.sidebar:
-    st.title("🛠️ Deployment Controls")
-    
-    # --- Mode Selection ---
-    st.header("Mode Selection")
-    st.session_state.snowflake_mode = st.toggle(
-        "❄️ **Snowflake Migration Mode**",
-        key='mode_toggle',
-        value=st.session_state.snowflake_mode,
-        help="ON: Decodes on GET, runs Search/Replace and Encoding automatically on UPSERT. OFF: Manual transforms required."
-    )
+    st.header("🔧 Environment & Mode")
+    base_url = st.text_input("API Environment (one URL)", value=st.session_state.get("base_url","api-us.kurtosys.app"))
+    st.session_state.base_url = base_url.strip()
+
+    snowflake_mode = st.checkbox("❄️ Snowflake Migration Mode (editable body)", value=st.session_state.get("snowflake_mode", True))
+    st.session_state.snowflake_mode = snowflake_mode
+
     st.markdown("---")
-    
-    # --- Credential Input ---
-    st.header("🔑 Credentials")
-    
+    st.header("🔑 Authentication (Source / Destination)")
+    st.write("Only the **credentials** differ — one base URL is used for both.")
+
     with st.form("auth_form"):
-        st.subheader("Source Environment")
-        s_url = st.text_input("Source URL", placeholder="e.g. source-api.com", key='s_url_input')
-        s_user = st.text_input("Source Username", key='s_user_input')
-        s_pass = st.text_input("Source Password", type="password", key='s_pass_input') 
-        s_client = st.text_input("Source Client Name", key='s_client_input')
+        st.subheader("Source Credentials")
+        s_user = st.text_input("Source Username", value=st.session_state.get("s_user",""))
+        s_pass = st.text_input("Source Password", type="password", value=st.session_state.get("s_pass",""))
+        s_client = st.text_input("Source Client Name", value=st.session_state.get("s_client",""))
 
-        st.subheader("Destination Environment")
-        d_url = st.text_input("Destination URL", placeholder="e.g. dest-api.com", key='d_url_input')
-        d_user = st.text_input("Destination Username", key='d_user_input_dest')
-        d_pass = st.text_input("Destination Password", type="password", key='d_pass_input_dest')
-        d_client = st.text_input("Destination Client Name", key='d_client_input_dest')
-        
-        auth_submitted = st.form_submit_button("Authenticate All")
-        
-        if auth_submitted:
-            # Authenticate Source
+        st.subheader("Destination Credentials")
+        d_user = st.text_input("Destination Username", value=st.session_state.get("d_user",""))
+        d_pass = st.text_input("Destination Password", type="password", value=st.session_state.get("d_pass",""))
+        d_client = st.text_input("Destination Client Name", value=st.session_state.get("d_client",""))
+
+        submitted = st.form_submit_button("Authenticate Both")
+        if submitted:
+            # store these values in session for persistence
+            st.session_state.update({
+                "s_user": s_user, "s_pass": s_pass, "s_client": s_client,
+                "d_user": d_user, "d_pass": d_pass, "d_client": d_client
+            })
             try:
-                st.session_state['source_token'] = authenticate(s_url, s_user, s_pass, s_client)
-                st.session_state['source_url'] = s_url 
-                st.success("✅ Source Auth Successful!")
+                st.info("Authenticating source...")
+                st.session_state.source_token = try_auth_endpoints(base_url, s_user, s_pass, s_client)
+                st.success("Source authenticated.")
             except Exception as e:
-                st.session_state['source_token'] = None
-                st.error(f"❌ Source Auth Failed: {e}")
-            
-            # Authenticate Destination
+                st.session_state.source_token = None
+                st.error(f"Source auth failed: {e}")
+
             try:
-                st.session_state['destination_token'] = authenticate(d_url, d_user, d_pass, d_client)
-                st.session_state['destination_url'] = d_url
-                st.success("✅ Destination Auth Successful!")
+                st.info("Authenticating destination...")
+                st.session_state.destination_token = try_auth_endpoints(base_url, d_user, d_pass, d_client)
+                st.success("Destination authenticated.")
             except Exception as e:
-                st.session_state['destination_token'] = None
-                st.error(f"❌ Destination Auth Failed: {e}")
-            
+                st.session_state.destination_token = None
+                st.error(f"Destination auth failed: {e}")
+
     st.markdown("---")
-    if st.button("🧹 Clear Workspace & Session"):
-        clear_workspace()
-        
-    st.caption("Deployment tool running via Streamlit")
+    st.header("🔍 Find & Replace (editable)")
+    # These are editable by default (user demanded)
+    find1 = st.text_input("Find 1 (e.g. staging schema)", value=st.session_state.get("find1","KURTOSYS_RPT_STG.NRC."))
+    replace1 = st.text_input("Replace 1 (e.g. prod schema)", value=st.session_state.get("replace1","KURTOSYS_RPT_PRD.NRC."))
+    find2 = st.text_input("Find 2 (e.g. staging view)", value=st.session_state.get("find2","snowflake_ntam_staging"))
+    replace2 = st.text_input("Replace 2 (e.g. prod view)", value=st.session_state.get("replace2","snowflake_ntam_prod"))
 
-# --- Main Page: Workflow Steps ---
-st.title("🚚 Dataset Deployment Workflow")
+    st.session_state.find1 = find1
+    st.session_state.replace1 = replace1
+    st.session_state.find2 = find2
+    st.session_state.replace2 = replace2
 
-col1, col2 = st.columns(2)
-col1.metric("Source Auth Status", "READY" if st.session_state['source_token'] else "PENDING")
-col2.metric("Destination Auth Status", "READY" if st.session_state['destination_token'] else "PENDING")
+    st.markdown("---")
+    if st.button("🧹 Clear local saved files"):
+        clear_local_files()
+        st.success("Local saved files cleared.")
 
-st.info(f"Current Mode: **{'SNOWFLAKE MIGRATION' if st.session_state.snowflake_mode else 'STANDARD'}**")
+# -------------------------
+# Main: Controls (top)
+# -------------------------
+col1, col2, col3 = st.columns([2,2,1])
+with col1:
+    if st.button("1️⃣ Pull Dataset Codes (list from source)", disabled=not st.session_state.get("source_token")):
+        try:
+            raw = fetch_dataset_codes(st.session_state.source_token, st.session_state.base_url)
+            st.session_state.dataset_codes_raw = raw
+            # Normalize codes list: try to extract 'code' or 'id' or 'name'
+            codes = []
+            for item in raw:
+                if isinstance(item, dict):
+                    for key in ("code","datasetCode","id","name"):
+                        if key in item:
+                            codes.append(str(item[key]))
+                            break
+                    else:
+                        # if no known key, dump repr
+                        codes.append(json.dumps(item))
+                else:
+                    codes.append(str(item))
+            st.session_state.dataset_codes_order = codes
+            # reset checks
+            st.session_state.deploy_checks = {c: False for c in codes}
+            st.session_state.delete_checks = {c: False for c in codes}
+            st.success(f"Pulled {len(codes)} dataset codes.")
+        except Exception as e:
+            st.error(f"Failed to pull dataset codes: {e}")
+
+with col2:
+    if st.button("2️⃣ Fetch selected dataset(s) data from source", disabled=not st.session_state.get("source_token")):
+        if not st.session_state.dataset_codes_order:
+            st.warning("No dataset codes available. Pull codes first.")
+        else:
+            fetched = 0
+            errors = []
+            for code in st.session_state.dataset_codes_order:
+                try:
+                    data = fetch_dataset(st.session_state.source_token, st.session_state.base_url, code)
+                    # If Snowflake mode -> leave body as editable JSON (no encoding)
+                    # Save the dataset payload as fetched so user can edit (body not encoded)
+                    save_local_dataset(code, data)
+                    fetched += 1
+                except Exception as e:
+                    errors.append((code, str(e)))
+            st.success(f"Fetched {fetched} datasets. {len(errors)} errors.")
+            if errors:
+                st.error(f"Errors for {len(errors)} datasets — check logs.")
+                for c, msg in errors[:5]:
+                    st.write(f"{c}: {msg}")
+
+with col3:
+    # quick indicators
+    src_status = "READY" if st.session_state.get("source_token") else "PENDING"
+    dst_status = "READY" if st.session_state.get("destination_token") else "PENDING"
+    st.metric("Source Auth", src_status)
+    st.metric("Destination Auth", dst_status)
 
 st.markdown("---")
 
-# 1. Pull Codes
-if st.button("1. Pull Dataset Codes List", disabled=not st.session_state['source_token'], help="Fetches list of codes from Source."):
-    pull_dataset_codes(st.session_state['source_token'], st.session_state['source_url'])
+# -------------------------
+# Dataset List & selection with checkboxes
+# -------------------------
+st.header("Dataset Inventory")
+if not st.session_state.dataset_codes_order:
+    st.info("No dataset list available. Click 'Pull Dataset Codes' to load the list from source.")
+else:
+    st.write("Select datasets to Deploy/Delete. Use the checkboxes then press the bulk action buttons below.")
+    # We'll render a table-like list with checkboxes
+    codes = st.session_state.dataset_codes_order
+    # ensure checks dict contains keys
+    for c in codes:
+        st.session_state.deploy_checks.setdefault(c, False)
+        st.session_state.delete_checks.setdefault(c, False)
 
-# 2. Get Data
-if st.button("2. Get Dataset Data", disabled=not st.session_state.step1_complete, help="Downloads data for all codes. Decodes payload if in Snowflake Mode."):
-    get_dataset_data(st.session_state['source_token'], st.session_state['source_url'], st.session_state.snowflake_mode)
+    # Render in a scrollable container
+    with st.container():
+        for c in codes:
+            cols = st.columns([3,1,1,1])
+            cols[0].write(f"**{c}**")
+            # show a small "local saved" or "not fetched" label
+            if c in st.session_state.local_files:
+                cols[0].caption("Local copy available")
+            else:
+                cols[0].caption("No local copy")
 
+            st.session_state.deploy_checks[c] = cols[1].checkbox("Deploy", value=st.session_state.deploy_checks[c], key=f"deploy_{c}")
+            st.session_state.delete_checks[c] = cols[2].checkbox("Delete", value=st.session_state.delete_checks[c], key=f"delete_{c}")
+            # quick action to open editor for this dataset
+            if cols[3].button("Open", key=f"open_{c}"):
+                st.session_state.selected_code = c
+                st.experimental_rerun()
+
+    st.markdown("---")
+
+    # Bulk actions
+    bcol1, bcol2, bcol3 = st.columns(3)
+    with bcol1:
+        if st.button("📤 Bulk Upsert Selected (deploy)", disabled=not st.session_state.get("destination_token")):
+            # iterate deploy checks
+            results = []
+            errors = []
+            for code, should in st.session_state.deploy_checks.items():
+                if not should: continue
+                # load local saved edits if exist, else load last fetched
+                payload = load_local_dataset(code)
+                if payload is None:
+                    st.warning(f"Skipping {code}: no local copy fetched.")
+                    continue
+                try:
+                    # For snowflake mode we assume body is JSON and editable; upsert payload as-is
+                    res = upsert_dataset(st.session_state.destination_token, st.session_state.base_url, code, payload)
+                    results.append((code, res))
+                except Exception as e:
+                    errors.append((code, str(e)))
+            st.success(f"Upsert attempts done. Success: {len(results)}. Errors: {len(errors)}")
+            if errors:
+                for c, msg in errors[:5]:
+                    st.error(f"{c}: {msg}")
+
+    with bcol2:
+        if st.button("🗑️ Bulk Delete Selected"):
+            results = []
+            errors = []
+            for code, should in st.session_state.delete_checks.items():
+                if not should: continue
+                try:
+                    res = delete_dataset(st.session_state.destination_token, st.session_state.base_url, code)
+                    results.append((code, res))
+                except Exception as e:
+                    errors.append((code, str(e)))
+            st.success(f"Delete attempts done. Success: {len(results)}. Errors: {len(errors)}")
+            if errors:
+                for c, msg in errors[:5]:
+                    st.error(f"{c}: {msg}")
+
+    with bcol3:
+        if st.button("🔄 Refresh local list (show saved files)"):
+            # Will show session_state.local_files content below
+            pass
+
+# -------------------------
+# Editor / Inspector panel
+# -------------------------
 st.markdown("---")
+st.header("Dataset Inspector & Editor")
 
-# --- 2.5 View & Edit Data (Manual Override) ---
-st.header("👀 2.5 View & Edit Data (Manual Override)")
-
-if st.session_state.step2_complete:
-    
-    file_list = [f for f in os.listdir(OUTPUT_DIR_DATA) if f.endswith('.json')]
-    
-    if file_list:
-        selected_file = st.selectbox(
-            "Select a file to view/edit:",
-            options=file_list,
-            key='file_select'
-        )
-        
-        file_path = os.path.join(OUTPUT_DIR_DATA, selected_file)
-        
-        # Load content when file is selected
-        with open(file_path, 'r') as f:
-            current_data = f.read()
-
-        st.subheader(f"Editing: {selected_file}")
-        
-        # Text area for editing (updates session state on change)
-        edited_content = st.text_area(
-            "Edit JSON Content:",
-            value=current_data,
-            height=300,
-            key='edited_json_content'
-        )
-
-        if st.button("💾 Save Manual Edits", type="primary"):
-            try:
-                # Validate JSON syntax before saving
-                json.loads(edited_content)
-                
-                with open(file_path, 'w') as f:
-                    f.write(edited_content)
-                st.success(f"Successfully saved manual edits to **{selected_file}**.")
-            except json.JSONDecodeError:
-                st.error("ERROR: Invalid JSON format. Please correct the syntax before saving.")
-
+selected = st.session_state.get("selected_code")
+if not selected:
+    # show a quick list of local files with open buttons
+    if st.session_state.local_files:
+        st.info("Open a dataset from the inventory above or choose one of the locally saved files.")
+        for k, v in st.session_state.local_files.items():
+            cols = st.columns([3,1,1])
+            cols[0].write(f"**{k}** — {v}")
+            if cols[1].button("Open", key=f"open_local_{k}"):
+                st.session_state.selected_code = k
+                st.experimental_rerun()
+            if cols[2].button("Delete local copy", key=f"del_local_{k}"):
+                try:
+                    os.remove(v)
+                except Exception:
+                    pass
+                st.session_state.local_files.pop(k, None)
+                st.success("Deleted local copy.")
+                st.experimental_rerun()
     else:
-        st.warning("No data files found in the input directory to edit.")
+        st.info("No local dataset fetched yet. Use 'Fetch selected dataset(s) data from source' to pull dataset payloads for editing.")
+
 else:
-    st.info("Run Step 2 to download dataset files before editing.")
+    st.subheader(f"Editing: {selected}")
+    # load payload (either local saved or fetch fresh from source)
+    payload = load_local_dataset(selected)
+    if payload is None:
+        # attempt to fetch live (fallback)
+        try:
+            payload = fetch_dataset(st.session_state.source_token, st.session_state.base_url, selected)
+            save_local_dataset(selected, payload)
+            payload = load_local_dataset(selected)
+            st.success("Fetched live copy to local store for editing.")
+        except Exception as e:
+            st.error(f"Cannot load dataset: {e}")
+            payload = None
 
+    if payload:
+        # Render metadata and body
+        # We allow editing only in Snowflake mode (as requested). In standard mode, it's read-only.
+        editable = bool(st.session_state.snowflake_mode)
+
+        # Show top-level keys, but allow full raw JSON editing for simplicity and power.
+        raw_json = json.dumps(payload, indent=2, ensure_ascii=False)
+        if editable:
+            edited = st.text_area("Edit full dataset JSON (body + metadata). Save to local before upsert.", value=raw_json, height=450, key=f"editor_{selected}")
+            col_save, col_reload = st.columns([1,1])
+            if col_save.button("💾 Save Edits", key=f"save_{selected}"):
+                # validate JSON
+                try:
+                    parsed = json.loads(edited)
+                    save_local_dataset(selected, parsed)
+                    st.success("Local edits saved.")
+                    st.session_state.edits_saved[selected] = time.time()
+                except json.JSONDecodeError as je:
+                    st.error(f"Invalid JSON: {je}")
+            if col_reload.button("🔁 Reload from local disk", key=f"reload_{selected}"):
+                payload = load_local_dataset(selected)
+                st.experimental_rerun()
+        else:
+            st.code(raw_json, language="json")
+            st.info("Standard mode: dataset body is not editable. To edit, enable Snowflake Migration Mode in the sidebar.")
+
+        # quick actions for single dataset
+        a_col1, a_col2, a_col3 = st.columns([1,1,1])
+        if a_col1.button("📤 Upsert this dataset", disabled=not st.session_state.get("destination_token")):
+            payload_to_send = load_local_dataset(selected) or payload
+            try:
+                res = upsert_dataset(st.session_state.destination_token, st.session_state.base_url, selected, payload_to_send)
+                st.success(f"Upsert succeeded for {selected}")
+                st.json(res)
+            except Exception as e:
+                st.error(f"Upsert failed: {e}")
+
+        if a_col2.button("🗑 Delete this dataset on destination", disabled=not st.session_state.get("destination_token")):
+            try:
+                res = delete_dataset(st.session_state.destination_token, st.session_state.base_url, selected)
+                st.success(f"Deleted {selected} on destination.")
+                st.json(res)
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
+        if a_col3.button("📥 Re-fetch live from source"):
+            try:
+                payload_live = fetch_dataset(st.session_state.source_token, st.session_state.base_url, selected)
+                save_local_dataset(selected, payload_live)
+                st.success("Refreshed local copy from source.")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
+
+# -------------------------
+# Footer: quick diagnostics
+# -------------------------
 st.markdown("---")
-
-# --- 3. Permanent Transform Settings (Always Editable) ---
-st.header("⚙️ Transform Settings (Always Editable)")
-st.caption("Edit the search/replace values here. These values are used regardless of the mode selected.")
-
-with st.expander("🔍 Search & Replace Values"):
-    r_col1, r_col2 = st.columns(2)
-    with r_col1:
-        # Note: The key names are explicit 'find1_ui', etc., to ensure they update correctly.
-        st.text_input("Find 1 (e.g., Staging Schema)", value=st.session_state['find1'], key="find1_ui")
-        st.text_input("Find 2 (e.g., Staging View Prefix)", value=st.session_state['find2'], key="find2_ui")
-    with r_col2:
-        st.text_input("Replace 1 (e.g., Production Schema)", value=st.session_state['replace1'], key="replace1_ui")
-        st.text_input("Replace 2 (e.g., Production View Prefix)", value=st.session_state['replace2'], key="replace2_ui")
-
-st.markdown("---")
-
-# 4. Conditional Transform Execution
-st.header("4. Run Optional Transforms")
-
-if not st.session_state.snowflake_mode:
-    # --- Standard Mode (Manual Execution) ---
-    st.warning("⚠️ **STANDARD MODE:** You must run these steps manually before Upserting.")
-    
-    col_search, col_encode = st.columns(2)
-    with col_search:
-        if st.button("Apply Search & Replace", disabled=not st.session_state.step2_complete):
-            # The function uses the values entered in the expander above (find1_ui, etc.)
-            replacements = {st.session_state.find1_ui: st.session_state.replace1_ui,
-                            st.session_state.find2_ui: st.session_state.replace2_ui}
-            replacements = {k: v for k, v in replacements.items() if k}
-            run_search_replace(replacements)
-    with col_encode:
-        if st.button("Apply Base64 Encoding", disabled=not st.session_state.step2_complete):
-            run_encoding()
+st.subheader("Diagnostics & Local files")
+st.write("Local files directory:", os.path.abspath(OUTPUT_DIR))
+if st.session_state.local_files:
+    st.write("Locally saved datasets:")
+    for k, v in st.session_state.local_files.items():
+        st.write(f"- {k}: {v}")
 else:
-    # --- Snowflake Mode (Automatic Execution) ---
-    st.success("✅ **SNOWFLAKE MODE:** The Find/Replace and Encoding steps will run **AUTOMATICALLY** when you click 'Upsert Datasets'.")
+    st.write("No local dataset files saved yet.")
 
-st.markdown("---")
-
-# 5. Upsert Button
-upsert_disabled = not (st.session_state.step2_complete and st.session_state['destination_token'])
-
-if st.button("3. Upsert Datasets to Destination", type="primary", disabled=upsert_disabled, help="Uploads transformed data to Destination."):
-    run_upsert(
-        st.session_state['destination_token'], 
-        st.session_state['destination_url'], 
-        st.session_state.snowflake_mode
-    )
+st.caption("Notes: This app tries common endpoints for authentication and CRUD. If your API uses different paths or auth response formats, adjust the endpoint paths in the helper functions (try_auth_endpoints, fetch_dataset_codes, fetch_dataset, upsert_dataset).")
