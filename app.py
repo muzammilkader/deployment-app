@@ -214,7 +214,7 @@ if "delete_checks" not in st.session_state:
     st.session_state.delete_checks = {}
 
 st.set_page_config(page_title="Dataset Deployment", layout="wide")
-st.title("🚚 Dataset Deployment Manager")
+st.title("Dataset Deployments")
 
 # -------------------------
 # Sidebar: Environment + Auth + Find/Replace
